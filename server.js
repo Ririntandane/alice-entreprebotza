@@ -1,193 +1,487 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import jwt from "jsonwebtoken";
-import { v4 as uuid } from "uuid";
+openapi: 3.1.0
+info:
+  title: Alice EntrepreBot API
+  version: 1.1.0
+servers:
+  - url: https://alice-entreprebotza.onrender.com
+paths:
+  /:
+    get:
+      operationId: ping
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  service: { type: string }
+                  time: { type: string }
 
-dotenv.config();
+  /business/create:
+    post:
+      operationId: createBusiness
+      summary: Create a business
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, industry]
+              properties:
+                name: { type: string }
+                industry: { type: string }
+                timezone: { type: string }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  businessId: { type: string }
+                  business:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      industry: { type: string }
+                      timezone: { type: string }
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+  /bookings:
+    get:
+      operationId: listBookings
+      summary: List bookings
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Booking" }
+        "401":
+          description: Missing or invalid X-Business-Id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      operationId: createBooking
+      summary: Create booking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateBookingRequest" }
+      responses:
+        "200":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Booking" }
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing or invalid X-Business-Id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
+  /leads:
+    post:
+      operationId: captureLead
+      summary: Capture a lead
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateLeadRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Lead" }
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing or invalid X-Business-Id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-// ---------------- In-memory data (swap to DB later) ----------------
-const businesses = {};   // id -> { name, industry, timezone }
-const bookings = [];     // { id, businessId, clientName, contact, service, when, staffId, notes, status }
-const leads = [];        // { id, businessId, name, contact, service, budget, source, notes }
-const staff = [];        // { id, businessId, name, nationalId, pin, role }
-const attendance = [];   // { id, businessId, staffId, type: "in"|"out", timestamp }
-const overtime = [];     // { id, businessId, staffId, hours, reason, status }
-const faqs = {};         // businessId -> [{ q, a }]
+  /faqs:
+    get:
+      operationId: listFaqs
+      summary: List FAQs
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FAQ" }
+        "401":
+          description: Missing or invalid X-Business-Id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    post:
+      operationId: setFaqs
+      summary: Set FAQs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                items:
+                  type: array
+                  items: { $ref: "#/components/schemas/FAQ" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing or invalid X-Business-Id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-// ---------------- Helpers ----------------
-const nowIso = () => new Date().toISOString();
+  /insights/weekly:
+    post:
+      operationId: getWeeklyInsights
+      summary: Weekly marketing insights (mock)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WeeklyInsights" }
+        "401":
+          description: Missing or invalid X-Business-Id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-const requireBusinessId = (req, res, next) => {
-  const bid = req.headers["x-business-id"];
-  if (!bid || !businesses[bid]) {
-    return res.status(401).json({ error: "Missing or invalid X-Business-Id" });
-  }
-  req.businessId = bid;
-  next();
-};
+  /insights/forecast:
+    post:
+      operationId: forecastRevenue
+      summary: Revenue forecast (toy model)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ForecastRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ForecastResponse" }
+        "401":
+          description: Missing or invalid X-Business-Id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-const requireStaffAuth = (req, res, next) => {
-  const auth = req.headers.authorization;
-  if (!auth) return res.status(401).json({ error: "Missing Authorization header" });
-  try {
-    const token = auth.replace(/^Bearer\s+/i, "");
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload; // { staffId, businessId, role, iat, exp }
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: "Invalid or expired token" });
-  }
-};
+  /staff/create:
+    post:
+      operationId: createStaff
+      summary: Create staff
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: string }
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing or invalid X-Business-Id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-// ---------------- Health ----------------
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "Alice Starter API", time: nowIso() });
-});
+  /staff/login:
+    post:
+      operationId: staffLogin
+      summary: Staff login (name + nationalId + pin → JWT)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StaffLoginResponse" }
+        "401":
+          description: Missing or invalid X-Business-Id or wrong credentials
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-// ---------------- Business ----------------
-app.post("/business/create", (req, res) => {
-  const { name, industry, timezone } = req.body || {};
-  if (!name || !industry) return res.status(400).json({ error: "name and industry required" });
-  const id = uuid();
-  businesses[id] = { name, industry, timezone: timezone || "Africa/Johannesburg" };
-  // seed a couple FAQs for convenience
-  faqs[id] = faqs[id] || [
-    { q: "What are your hours?", a: "Mon–Sat 09:00–18:00" },
-    { q: "Do you accept walk-ins?", a: "Yes, subject to availability." }
-  ];
-  res.json({ businessId: id, business: businesses[id] });
-});
+  /staff/agenda:
+    get:
+      operationId: getStaffAgenda
+      summary: Staff agenda (requires Bearer JWT)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bookings:
+                    type: array
+                    items: { $ref: "#/components/schemas/Booking" }
+        "401":
+          description: Missing/invalid Bearer token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-// ---------------- Staff ----------------
-app.post("/staff/create", requireBusinessId, (req, res) => {
-  const { name, nationalId, pin, role } = req.body || {};
-  if (!name || !nationalId || !pin) return res.status(400).json({ error: "name, nationalId, pin required" });
-  const id = uuid();
-  staff.push({ id, businessId: req.businessId, name, nationalId, pin, role: role || "staff" });
-  res.json({ id });
-});
+  /staff/clock-in:
+    post:
+      operationId: staffClockIn
+      summary: Clock in (requires Bearer JWT)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean } }
+        "401":
+          description: Missing/invalid Bearer token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-app.post("/staff/login", requireBusinessId, (req, res) => {
-  const { name, nationalId, pin } = req.body || {};
-  const person = staff.find(
-    s => s.businessId === req.businessId && s.name === name && s.nationalId === nationalId && s.pin === pin
-  );
-  if (!person) return res.status(401).json({ error: "Invalid credentials" });
-  const token = jwt.sign({ staffId: person.id, businessId: req.businessId, role: person.role }, JWT_SECRET, { expiresIn: "8h" });
-  res.json({ token, staff: { id: person.id, name: person.name, role: person.role } });
-});
+  /staff/clock-out:
+    post:
+      operationId: staffClockOut
+      summary: Clock out (requires Bearer JWT)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { ok: { type: boolean } }
+        "401":
+          description: Missing/invalid Bearer token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-app.get("/staff/agenda", requireStaffAuth, (req, res) => {
-  const items = bookings.filter(b => b.businessId === req.user.businessId && b.staffId === req.user.staffId && b.status !== "cancelled");
-  res.json({ bookings: items });
-});
+  /staff/overtime:
+    post:
+      operationId: requestOvertime
+      summary: Overtime request (requires Bearer JWT)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OvertimeRequest" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Overtime" }
+        "400":
+          description: Bad request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing/invalid Bearer token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
-app.post("/staff/clock-in", requireStaffAuth, (req, res) => {
-  attendance.push({ id: uuid(), businessId: req.user.businessId, staffId: req.user.staffId, type: "in", timestamp: nowIso() });
-  res.json({ ok: true });
-});
-app.post("/staff/clock-out", requireStaffAuth, (req, res) => {
-  attendance.push({ id: uuid(), businessId: req.user.businessId, staffId: req.user.staffId, type: "out", timestamp: nowIso() });
-  res.json({ ok: true });
-});
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
 
-app.post("/staff/overtime", requireStaffAuth, (req, res) => {
-  const { hours, reason } = req.body || {};
-  if (typeof hours !== "number" || hours <= 0) return res.status(400).json({ error: "hours must be a positive number" });
-  const entry = { id: uuid(), businessId: req.user.businessId, staffId: req.user.staffId, hours, reason: reason || "", status: "pending" };
-  overtime.push(entry);
-  res.json(entry);
-});
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: { type: string }
 
-// ---------------- Bookings ----------------
-app.get("/bookings", requireBusinessId, (req, res) => {
-  const list = bookings.filter(b => b.businessId === req.businessId);
-  res.json(list);
-});
-app.post("/bookings", requireBusinessId, (req, res) => {
-  const { clientName, contact, service, when, staffId, notes } = req.body || {};
-  if (!clientName || !contact || !service || !when) return res.status(400).json({ error: "clientName, contact, service, when required" });
-  const entry = {
-    id: uuid(),
-    businessId: req.businessId,
-    clientName,
-    contact,
-    service,
-    when,
-    staffId: staffId || null,
-    notes: notes || "",
-    status: "confirmed"
-  };
-  bookings.push(entry);
-  res.json(entry);
-});
+    Booking:
+      type: object
+      properties:
+        id: { type: string }
+        businessId: { type: string }
+        clientName: { type: string }
+        contact: { type: string }
+        service: { type: string }
+        when: { type: string }
+        staffId: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
+        status: { type: string }
 
-// ---------------- Leads ----------------
-app.post("/leads", requireBusinessId, (req, res) => {
-  const { name, contact, service, budget, source, notes } = req.body || {};
-  if (!name || !contact || !service) return res.status(400).json({ error: "name, contact, service required" });
-  const entry = { id: uuid(), businessId: req.businessId, name, contact, service, budget: budget || "", source: source || "", notes: notes || "" };
-  leads.push(entry);
-  res.json(entry);
-});
+    CreateBookingRequest:
+      type: object
+      required: [clientName, contact, service, when]
+      properties:
+        clientName: { type: string }
+        contact: { type: string }
+        service: { type: string }
+        when: { type: string }
+        staffId: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
 
-// ---------------- FAQs ----------------
-app.get("/faqs", requireBusinessId, (req, res) => {
-  res.json(faqs[req.businessId] || []);
-});
-app.post("/faqs", requireBusinessId, (req, res) => {
-  const { items } = req.body || {};
-  if (!Array.isArray(items)) return res.status(400).json({ error: "items array required" });
-  faqs[req.businessId] = items;
-  res.json({ ok: true });
-});
+    Lead:
+      type: object
+      properties:
+        id: { type: string }
+        businessId: { type: string }
+        name: { type: string }
+        contact: { type: string }
+        service: { type: string }
+        budget: { type: string }
+        source: { type: string }
+        notes: { type: string }
 
-// ---------------- Insights (mocked logic for MVP) ----------------
-app.post("/insights/weekly", requireBusinessId, (req, res) => {
-  const biz = businesses[req.businessId];
-  const industry = biz?.industry || "general";
-  const plan = {
-    weekOf: nowIso().slice(0, 10),
-    industry,
-    trends: [
-      "Payday promos boost conversions (15th, 25th–30th)",
-      "Short-form video (15–30s) outperforms",
-      "UGC/testimonials increase trust"
-    ],
-    suggestedPosts: [
-      { platform: "Instagram", day: "Thu", time: "18:00", caption: `Payday glow-up ✨ Book now & save 10%. #PaydaySpecial #${industry}` },
-      { platform: "TikTok", day: "Sat", time: "11:00", caption: `Behind the scenes + quick tips 🎥 #${industry}Tips` },
-      { platform: "Facebook", day: "Tue", time: "12:30", caption: "Client story + referral rewards 💬 #HappyClients" }
-    ],
-    bestTimes: { Instagram: ["18:00"], TikTok: ["11:00"], Facebook: ["12:30"] },
-    paydayWindows: ["15th", "25th–30th"],
-    forecastNote: "Assumes +8–15% uplift around payday; adjust with your past weeks’ data."
-  };
-  res.json(plan);
-});
+    CreateLeadRequest:
+      type: object
+      required: [name, contact, service]
+      properties:
+        name: { type: string }
+        contact: { type: string }
+        service: { type: string }
+        budget: { type: string }
+        source: { type: string }
+        notes: { type: string }
 
-app.post("/insights/forecast", requireBusinessId, (req, res) => {
-  const { baselineWeeklyRevenue = 10000, marketingSpend = 1500 } = req.body || {};
-  const paydayBoost = 0.12;
-  const trendBoost = 0.05;
-  const projected = Math.round(baselineWeeklyRevenue * (1 + paydayBoost + trendBoost));
-  const estimatedROI = Number((((projected - baselineWeeklyRevenue) - marketingSpend) / Math.max(marketingSpend, 1)).toFixed(2));
-  res.json({
-    baselineWeeklyRevenue,
-    projectedWeeklyRevenue: projected,
-    assumedLifts: { paydayBoost, trendBoost },
-    marketingSpend,
-    estimatedROI
-  });
-});
+    FAQ:
+      type: object
+      properties:
+        q: { type: string }
+        a: { type: string }
 
-// ---------------- Start ----------------
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Alice API listening on :${PORT}`));
+    WeeklyInsights:
+      type: object
+      properties:
+        weekOf: { type: string }
+        industry: { type: string }
+        trends:
+          type: array
+          items: { type: string }
+        suggestedPosts:
+          type: array
+          items:
+            type: object
+            properties:
+              platform: { type: string }
+              day: { type: string }
+              time: { type: string }
+              caption: { type: string }
+        paydayWindows:
+          type: array
+          items: { type: string }
+        forecastNote: { type: string }
+
+    ForecastRequest:
+      type: object
+      properties:
+        baselineWeeklyRevenue: { type: number, default: 10000 }
+        marketingSpend: { type: number, default: 1500 }
+
+    ForecastResponse:
+      type: object
+      properties:
+        baselineWeeklyRevenue: { type: number }
+        projectedWeeklyRevenue: { type: number }
+        assumedLifts:
+          type: object
+          properties:
+            paydayBoost: { type: number }
+            trendBoost: { type: number }
+        marketingSpend: { type: number }
+        estimatedROI: { type: number }
+
+    StaffLoginRequest:
+      type: object
+      required: [name, nationalId, pin]
+      properties:
+        name: { type: string }
+        nationalId: { type: string }
+        pin: { type: string }
+
+    StaffLoginResponse:
+      type: object
+      properties:
+        token: { type: string }
+        staff:
+          type: object
+          properties:
+            id: { type: string }
+            name: { type: string }
+            role: { type: string }
+
+    OvertimeRequest:
+      type: object
+      required: [hours, reason]
+      properties:
+        hours: { type: number }
+        reason: { type: string }
+
+    Overtime:
+      type: object
+      properties:
+        id: { type: string }
+        businessId: { type: string }
+        staffId: { type: string }
+        hours: { type: number }
+        reason: { type: string }
+        status: { type: string }
