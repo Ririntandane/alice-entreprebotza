@@ -1,4 +1,4 @@
-// ===== Alice EntrepreBot Server (CommonJS, all-in-one, fast EFT flow) =====
+// ===== Alice EntrepreBot Server (CommonJS, zero Business-ID required) =====
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
@@ -16,19 +16,18 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 
 // ---------------- In-memory data ----------------
 const businesses = {};   // id -> { name, industry, timezone }
-const bookings = [];     // { id, businessId, clientName, contact, service, when, staffId, notes, status }
-const leads = [];        // { id, businessId, name, contact, service, budget, source, notes }
-const staff = [];        // { id, businessId, name, nationalId, pin, role }
-const attendance = [];   // { id, businessId, staffId, type, timestamp }
-const overtime = [];     // { id, businessId, staffId, hours, reason, status }
-const faqs = {};         // businessId -> [{q,a}]
+const bizIndex = {};     // key -> businessId  (key = normalized "name|industry" or contact)
+const bookings = [];
+const leads = [];
+const staff = [];
+const attendance = [];
+const overtime = [];
+const faqs = {};
+const subscriptions = {};     // businessId -> { packageId, status, currentPeriodEnd }
+const usageCounts = {};       // businessId -> number (free basic calls)
+const pendingApprovals = {};  // token -> { businessId|null, packageId, amount, provisionalRef, businessName, industry, contact, requestedAt }
 
-// ===== Packages / Paywall state =====
-const subscriptionsPkg = {};     // businessId -> { packageId, status, currentPeriodEnd }
-const usageCountsPkg = {};       // businessId -> # of free basic calls
-const pendingApprovalsPkg = {};  // token -> { businessId|null, packageId, amount, provisionalRef, businessName, industry, contact, requestedAt }
-
-// ===== Packages (luxury copy, no "AI") =====
+// ===== Packages =====
 const PACKAGES = {
   basic: {
     id: "basic",
@@ -48,9 +47,9 @@ const PACKAGES = {
     price: 250,
     benefits: [
       "Everything in Basic",
-      "2× Virtual Consultations per month (strategy sessions with Alice)",
+      "2× Virtual Consultations per month",
       "Automatic reminders to staff/clients",
-      "Priority booking system for CEO/staff scheduling"
+      "Priority CEO/staff scheduling"
     ]
   },
   elite: {
@@ -59,56 +58,73 @@ const PACKAGES = {
     price: 500,
     benefits: [
       "Everything in Pro",
-      "Tailor-made consulting: strategy plans, competitor benchmarks, ROI planning",
-      "More virtual consultations (up to 4–6 per month)",
+      "Tailored strategy & ROI planning",
+      "More consultations (4–6/month)",
       "Premium analytics & KPI dashboards",
-      "Referral & reward automation (client suggestions, referrals, loyalty discounts)"
+      "Referral & reward automation"
     ]
   }
 };
 
+// ===== Email transport =====
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+});
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_KEY   = process.env.ADMIN_KEY || "change-me";
+const BASE_URL    = process.env.PUBLIC_BASE_URL || "http://localhost:8080";
+
 // ===== Helpers =====
 const nowIso = () => new Date().toISOString();
+const norm = (s="") => String(s).trim().toLowerCase();
 
-const requireBusinessId = (req, res, next) => {
-  const bid = req.headers["x-business-id"];
-  if (!bid || !businesses[bid]) {
-    return res.status(401).json({ error: "Missing or invalid X-Business-Id" });
-  }
-  req.businessId = bid;
-  next();
-};
+// Create or find a business automatically (no headers)
+function ensureBusiness({ businessName, industry, contact }) {
+  const name = businessName || "Auto Business";
+  const ind  = industry || "general";
+  const key1 = `${norm(name)}|${norm(ind)}`;
+  const key2 = contact ? `c:${norm(contact)}` : null;
 
-const requireStaffAuth = (req, res, next) => {
-  const auth = req.headers.authorization;
-  if (!auth) return res.status(401).json({ error: "Missing Authorization header" });
-  try {
-    const token = auth.replace(/^Bearer\s+/i, "");
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    next();
-  } catch {
-    return res.status(401).json({ error: "Invalid or expired token" });
-  }
-};
+  let bid = bizIndex[key1] || (key2 ? bizIndex[key2] : null);
+  if (bid && businesses[bid]) return bid;
 
-function hasActiveSubPkg(bid, packageId) {
-  const s = subscriptionsPkg[bid];
+  bid = uuid();
+  businesses[bid] = { name, industry: ind, timezone: "Africa/Johannesburg" };
+  faqs[bid] = faqs[bid] || [
+    { q: "What are your hours?", a: "Mon–Sat 09:00–18:00" },
+    { q: "Do you accept walk-ins?", a: "Yes, subject to availability." }
+  ];
+  bizIndex[key1] = bid;
+  if (key2) bizIndex[key2] = bid;
+  return bid;
+}
+
+function hasActiveSub(bid, packageId) {
+  const s = subscriptions[bid];
   const now = Math.floor(Date.now()/1000);
   return !!(s && s.status === "active" && s.packageId === packageId && (!s.currentPeriodEnd || s.currentPeriodEnd > now));
 }
 
-// Gate: Basic gets first 40 calls free; Pro/Elite always paid
+// Gate: Basic gets 40 free calls; Pro/Elite paid
 function gateByPackage(packageId = "basic") {
   return (req, res, next) => {
-    const bid = req.headers["x-business-id"];
-    if (!bid) return res.status(401).json({ error: "Missing or invalid X-Business-Id" });
+    const { businessName, industry, contact } = req.body || {};
+    const bid = ensureBusiness({ businessName, industry, contact });
 
-    if (hasActiveSubPkg(bid, packageId)) return next();
+    if (hasActiveSub(bid, packageId)) {
+      req.businessId = bid;
+      return next();
+    }
 
     if (packageId === "basic") {
-      usageCountsPkg[bid] = (usageCountsPkg[bid] || 0) + 1;
-      if (usageCountsPkg[bid] <= 40) return next();
+      usageCounts[bid] = (usageCounts[bid] || 0) + 1;
+      if (usageCounts[bid] <= 40) {
+        req.businessId = bid;
+        return next();
+      }
     }
 
     return res.status(402).json({
@@ -121,16 +137,19 @@ function gateByPackage(packageId = "basic") {
   };
 }
 
-// ===== Email transport (Gmail App Password) =====
-const mailer = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: false,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
-});
-const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-const ADMIN_KEY   = process.env.ADMIN_KEY || "change-me";
-const BASE_URL    = process.env.PUBLIC_BASE_URL || "http://localhost:8080";
+// Staff JWT (kept for completeness; not needed by GPT)
+function requireStaffAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: "Missing Authorization header" });
+  try {
+    const token = auth.replace(/^Bearer\s+/i, "");
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
 
 async function sendEmail(to, subject, html) {
   try { await mailer.sendMail({ from: process.env.SMTP_USER, to, subject, html }); }
@@ -138,43 +157,39 @@ async function sendEmail(to, subject, html) {
 }
 
 // ================= Health =================
-app.get("/", (_req, res) => res.json({ ok: true, service: "Alice Starter API", time: nowIso() }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "Alice API", time: nowIso() }));
 app.get("/healthz", (_req, res) => res.json({ ok: true, time: nowIso() }));
 
-// ================= Business =================
+// ================= Business (optional; still usable) =================
 app.post("/business/create", (req, res) => {
   const { name, industry, timezone } = req.body || {};
   if (!name || !industry) return res.status(400).json({ error: "name and industry required" });
-  const id = uuid();
-  businesses[id] = { name, industry, timezone: timezone || "Africa/Johannesburg" };
-  faqs[id] = faqs[id] || [
-    { q: "What are your hours?", a: "Mon–Sat 09:00–18:00" },
-    { q: "Do you accept walk-ins?", a: "Yes, subject to availability." }
-  ];
+  const id = ensureBusiness({ businessName: name, industry, contact: null });
+  businesses[id].timezone = timezone || "Africa/Johannesburg";
   res.json({ businessId: id, business: businesses[id] });
 });
 
-// ================= Staff =================
-app.post("/staff/create", requireBusinessId, (req, res) => {
-  const { name, nationalId, pin, role } = req.body || {};
+// ================= Staff (optional JWT features) =================
+app.post("/staff/create", (req, res) => {
+  const { businessName, industry, contact, name, nationalId, pin, role } = req.body || {};
   if (!name || !nationalId || !pin) return res.status(400).json({ error: "name, nationalId, pin required" });
+  const bid = ensureBusiness({ businessName, industry, contact });
   const id = uuid();
-  staff.push({ id, businessId: req.businessId, name, nationalId, pin, role: role || "staff" });
-  res.json({ id });
+  staff.push({ id, businessId: bid, name, nationalId, pin, role: role || "staff" });
+  res.json({ id, businessId: bid });
 });
-app.post("/staff/login", requireBusinessId, (req, res) => {
-  const { name, nationalId, pin } = req.body || {};
+
+app.post("/staff/login", (req, res) => {
+  const { businessName, industry, contact, name, nationalId, pin } = req.body || {};
+  const bid = ensureBusiness({ businessName, industry, contact });
   const person = staff.find(
-    s => s.businessId === req.businessId && s.name === name && s.nationalId === nationalId && s.pin === pin
+    s => s.businessId === bid && s.name === name && s.nationalId === nationalId && s.pin === pin
   );
   if (!person) return res.status(401).json({ error: "Invalid credentials" });
-  const token = jwt.sign(
-    { staffId: person.id, businessId: req.businessId, role: person.role },
-    JWT_SECRET,
-    { expiresIn: "8h" }
-  );
-  res.json({ token, staff: { id: person.id, name: person.name, role: person.role } });
+  const token = jwt.sign({ staffId: person.id, businessId: bid, role: person.role }, JWT_SECRET, { expiresIn: "8h" });
+  res.json({ token, staff: { id: person.id, name: person.name, role: person.role }, businessId: bid });
 });
+
 app.get("/staff/agenda", requireStaffAuth, (req, res) => {
   const items = bookings.filter(b => b.businessId === req.user.businessId && b.staffId === req.user.staffId && b.status !== "cancelled");
   res.json({ bookings: items });
@@ -189,51 +204,72 @@ app.post("/staff/clock-out", requireStaffAuth, (req, res) => {
 });
 app.post("/staff/overtime", requireStaffAuth, (req, res) => {
   const { hours, reason } = req.body || {};
-  if (typeof hours !== "number" || hours <= 0) return res.status(400).json({ error: "hours must be a positive number" });
+  if (typeof hours !== "number" || hours <= 0) return res.status(400).json({ error: "hours must be positive" });
   const entry = { id: uuid(), businessId: req.user.businessId, staffId: req.user.staffId, hours, reason: reason || "", status: "pending" };
   overtime.push(entry);
   res.json(entry);
 });
 
-// ================= Bookings =================
-app.get("/bookings", requireBusinessId, (req, res) => {
-  const list = bookings.filter(b => b.businessId === req.businessId);
-  res.json(list);
+// ================= Bookings (no Business-ID; auto) =================
+app.get("/bookings", (req, res) => {
+  const { businessName, industry, contact } = req.query || {};
+  const bid = ensureBusiness({ businessName, industry, contact });
+  const list = bookings.filter(b => b.businessId === bid);
+  res.json({ businessId: bid, bookings: list });
 });
-app.post("/bookings", requireBusinessId, (req, res) => {
-  const { clientName, contact, service, when, staffId, notes } = req.body || {};
-  if (!clientName || !contact || !service || !when) return res.status(400).json({ error: "clientName, contact, service, when required" });
+app.post("/bookings", (req, res) => {
+  const { businessName, industry, contact, clientName, clientContact, service, when, staffId, notes } = req.body || {};
+  if (!clientName || !(contact || clientContact) || !service || !when) {
+    return res.status(400).json({ error: "clientName, contact/clientContact, service, when required" });
+  }
+  const bid = ensureBusiness({ businessName, industry, contact: contact || clientContact });
   const entry = {
-    id: uuid(), businessId: req.businessId, clientName, contact, service, when,
-    staffId: staffId || null, notes: notes || "", status: "confirmed"
+    id: uuid(),
+    businessId: bid,
+    clientName,
+    contact: contact || clientContact,
+    service,
+    when,
+    staffId: staffId || null,
+    notes: notes || "",
+    status: "confirmed"
   };
   bookings.push(entry);
-  res.json(entry);
+  res.json({ businessId: bid, booking: entry });
 });
 
 // ================= Leads =================
-app.post("/leads", requireBusinessId, (req, res) => {
-  const { name, contact, service, budget, source, notes } = req.body || {};
-  if (!name || !contact || !service) return res.status(400).json({ error: "name, contact, service required" });
-  const entry = { id: uuid(), businessId: req.businessId, name, contact, service, budget: budget || "", source: source || "", notes: notes || "" };
+app.post("/leads", (req, res) => {
+  const { businessName, industry, contact, name, service, budget, source, notes } = req.body || {};
+  const clientContact = req.body.clientContact || contact;
+  if (!name || !clientContact || !service) return res.status(400).json({ error: "name, contact, service required" });
+  const bid = ensureBusiness({ businessName, industry, contact: clientContact });
+  const entry = { id: uuid(), businessId: bid, name, contact: clientContact, service, budget: budget || "", source: source || "", notes: notes || "" };
   leads.push(entry);
-  res.json(entry);
+  res.json({ businessId: bid, lead: entry });
 });
 
 // ================= FAQs =================
-app.get("/faqs", requireBusinessId, (req, res) => res.json(faqs[req.businessId] || []));
-app.post("/faqs", requireBusinessId, (req, res) => {
-  const { items } = req.body || {};
+app.get("/faqs", (req, res) => {
+  const { businessName, industry, contact } = req.query || {};
+  const bid = ensureBusiness({ businessName, industry, contact });
+  res.json({ businessId: bid, items: faqs[bid] || [] });
+});
+app.post("/faqs", (req, res) => {
+  const { businessName, industry, contact, items } = req.body || {};
+  const bid = ensureBusiness({ businessName, industry, contact });
   if (!Array.isArray(items)) return res.status(400).json({ error: "items array required" });
-  faqs[req.businessId] = items;
-  res.json({ ok: true });
+  faqs[bid] = items;
+  res.json({ businessId: bid, ok: true });
 });
 
-// ================= Insights (mock logic) =================
-app.post("/insights/weekly", requireBusinessId, gateByPackage("basic"), (req, res) => {
-  const biz = businesses[req.businessId] || {};
+// ================= Insights (mock logic; auto business) =================
+app.post("/insights/weekly", gateByPackage("basic"), (req, res) => {
+  const bid = req.businessId || ensureBusiness(req.body || {});
+  const biz = businesses[bid] || {};
   const industry = biz.industry || "general";
   res.json({
+    businessId: bid,
     weekOf: nowIso().slice(0, 10),
     industry,
     trends: [
@@ -250,12 +286,14 @@ app.post("/insights/weekly", requireBusinessId, gateByPackage("basic"), (req, re
   });
 });
 
-app.post("/insights/forecast", requireBusinessId, gateByPackage("basic"), (req, res) => {
+app.post("/insights/forecast", gateByPackage("basic"), (req, res) => {
+  const bid = req.businessId || ensureBusiness(req.body || {});
   const { baselineWeeklyRevenue = 10000, marketingSpend = 1500 } = req.body || {};
   const paydayBoost = 0.12, trendBoost = 0.05;
   const projected = Math.round(baselineWeeklyRevenue * (1 + paydayBoost + trendBoost));
   const estimatedROI = Number((((projected - baselineWeeklyRevenue) - marketingSpend) / Math.max(marketingSpend, 1)).toFixed(2));
   res.json({
+    businessId: bid,
     baselineWeeklyRevenue,
     projectedWeeklyRevenue: projected,
     assumedLifts: { paydayBoost, trendBoost },
@@ -264,34 +302,28 @@ app.post("/insights/forecast", requireBusinessId, gateByPackage("basic"), (req, 
   });
 });
 
-// ================= Example gated routes for Pro / Elite =================
-app.post("/consultations", requireBusinessId, gateByPackage("pro"), (req, res) => {
-  // Demo only
-  res.json({ ok: true, note: "Consultation booked (demo). Replace with your own logic." });
+// ================= Pro / Elite demo gates =================
+app.post("/consultations", gateByPackage("pro"), (req, res) => {
+  const bid = req.businessId || ensureBusiness(req.body || {});
+  res.json({ businessId: bid, ok: true, note: "Consultation booked (demo)" });
 });
-app.post("/upgrade/premium", requireBusinessId, gateByPackage("elite"), (req, res) => {
-  // Demo only
-  res.json({ ok: true, note: "Premium upgrade active (demo). Replace with your own logic." });
+app.post("/upgrade/premium", gateByPackage("elite"), (req, res) => {
+  const bid = req.businessId || ensureBusiness(req.body || {});
+  res.json({ businessId: bid, ok: true, note: "Premium upgrade active (demo)" });
 });
 
-// ===================================================================
-//                BILLING: Packages, EFT (no header), Email approval
-// ===================================================================
-
-// List packages
+// ================= Billing: Packages & EFT (no business needed) =================
 app.get("/billing/packages", (_req, res) => {
   res.json(Object.values(PACKAGES).map(p => ({
     id: p.id, name: p.name, price: p.price, benefits: p.benefits
   })));
 });
 
-// Start EFT — FAST PATH (no Business-Id required)
+// Start EFT — no business required
 app.post("/billing/eft/start", (req, res) => {
   const { packageId = "basic", businessName = "New Business", industry = "general", contact = "" } = req.body || {};
   const pack = PACKAGES[packageId] || PACKAGES.basic;
-
-  const headerBid = req.headers["x-business-id"];
-  const provisionalRef = headerBid || ("P-" + uuid().slice(0,6).toUpperCase());
+  const provisionalRef = "P-" + uuid().slice(0, 6).toUpperCase();
 
   const message = `💳 EFT Payment Instructions
 Service: ${pack.name}
@@ -305,39 +337,19 @@ Reference: ${provisionalRef}
 
 After payment, reply: DONE`;
 
-  res.json({
-    ok: true,
-    packageId: pack.id,
-    amount: pack.price,
-    message,
-    provisionalRef,
-    note: headerBid ? "Using your Business ID as reference." : "Fast start: no Business ID yet; using provisional reference."
-  });
+  res.json({ ok: true, packageId: pack.id, amount: pack.price, message, provisionalRef, businessName, industry, contact });
 });
 
-// Confirm EFT (DONE) — FAST PATH (no Business-Id required)
+// DONE — email admin; business created on approval if missing
 app.post("/billing/eft/done", (req, res) => {
-  const {
-    packageId = "basic",
-    provisionalRef = "",
-    businessName = "New Business",
-    industry = "general",
-    contact = ""
-  } = req.body || {};
-
+  const { packageId = "basic", provisionalRef = "", businessName = "New Business", industry = "general", contact = "" } = req.body || {};
   const pack = PACKAGES[packageId] || PACKAGES.basic;
-  const headerBid = req.headers["x-business-id"];
   const token = uuid().slice(0, 6).toUpperCase();
 
-  pendingApprovalsPkg[token] = {
-    businessId: headerBid || null,
-    packageId: pack.id,
-    amount: pack.price,
-    requestedAt: Date.now(),
+  pendingApprovals[token] = {
+    businessId: null, packageId: pack.id, amount: pack.price, requestedAt: Date.now(),
     provisionalRef: provisionalRef || ("P-" + uuid().slice(0,6).toUpperCase()),
-    businessName,
-    industry,
-    contact
+    businessName, industry, contact
   };
 
   const approveLink = `${BASE_URL}/admin/approve?token=${token}&days=30&key=${encodeURIComponent(ADMIN_KEY)}`;
@@ -345,39 +357,29 @@ app.post("/billing/eft/done", (req, res) => {
 
   const html = `
     <h3>EFT Claim</h3>
-    <p><b>Provisional Ref:</b> ${pendingApprovalsPkg[token].provisionalRef}</p>
+    <p><b>Ref:</b> ${pendingApprovals[token].provisionalRef}</p>
     <p><b>Package:</b> ${pack.name} (R${pack.price})</p>
-    <p><b>BusinessId:</b> ${headerBid || "(none yet)"} </p>
     <p><b>Business Name:</b> ${businessName}</p>
     <p><b>Industry:</b> ${industry}</p>
     <p><b>Contact:</b> ${contact}</p>
     <p><a href="${approveLink}">✅ Approve 30 days</a> | <a href="${denyLink}">❌ Deny</a></p>
   `;
-  sendEmail(ADMIN_EMAIL, `[Alice EFT] ${pack.name} — Ref ${pendingApprovalsPkg[token].provisionalRef}`, html);
+  sendEmail(ADMIN_EMAIL, `[Alice EFT] ${pack.name} — Ref ${pendingApprovals[token].provisionalRef}`, html);
 
   res.json({ ok: true, message: "Claim sent to admin. You’ll be unlocked after verification.", token });
 });
 
-// Approve — auto-creates a Business if missing
 app.get("/admin/approve", (req, res) => {
   const { token, days = "30", key } = req.query || {};
   if (key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
-  const pending = pendingApprovalsPkg[token];
+  const pending = pendingApprovals[token];
   if (!pending) return res.status(400).send("Invalid token");
 
-  // Ensure we have a businessId; if missing, create one from pending info
-  let bid = pending.businessId;
-  if (!bid) {
-    bid = uuid();
-    businesses[bid] = {
-      name: pending.businessName || "Approved Business",
-      industry: pending.industry || "general",
-      timezone: "Africa/Johannesburg"
-    };
-  }
+  // Create business on approval
+  const bid = ensureBusiness({ businessName: pending.businessName, industry: pending.industry, contact: pending.contact });
 
   const expiresAt = Date.now() + Number(days) * 24 * 3600 * 1000;
-  subscriptionsPkg[bid] = {
+  subscriptions[bid] = {
     status: "active",
     packageId: pending.packageId,
     currentPeriodEnd: Math.floor(expiresAt / 1000)
@@ -391,16 +393,15 @@ app.get("/admin/approve", (req, res) => {
     <p><b>Ref:</b> ${pending.provisionalRef}</p>
     <p><b>Name/Industry:</b> ${pending.businessName} / ${pending.industry}</p>
   `;
-  delete pendingApprovalsPkg[token];
+  delete pendingApprovals[token];
   res.setHeader("Content-Type", "text/html");
   res.send(approvedHtml);
 });
 
-// Deny
 app.get("/admin/deny", (req, res) => {
   const { token, key } = req.query || {};
   if (key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
-  delete pendingApprovalsPkg[token];
+  delete pendingApprovals[token];
   res.send("<h3>Denied</h3>");
 });
 
