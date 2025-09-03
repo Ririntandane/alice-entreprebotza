@@ -1,4 +1,4 @@
-// ===== Alice EntrepreBot Server (CommonJS, all-in-one) =====
+// ===== Alice EntrepreBot Server (CommonJS, all-in-one, fast EFT flow) =====
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
@@ -16,14 +16,58 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 
 // ---------------- In-memory data ----------------
 const businesses = {};   // id -> { name, industry, timezone }
-const bookings = [];     // { ... }
-const leads = [];        // { ... }
-const staff = [];        // { ... }
-const attendance = [];   // { ... }
-const overtime = [];     // { ... }
+const bookings = [];     // { id, businessId, clientName, contact, service, when, staffId, notes, status }
+const leads = [];        // { id, businessId, name, contact, service, budget, source, notes }
+const staff = [];        // { id, businessId, name, nationalId, pin, role }
+const attendance = [];   // { id, businessId, staffId, type, timestamp }
+const overtime = [];     // { id, businessId, staffId, hours, reason, status }
 const faqs = {};         // businessId -> [{q,a}]
 
-// ================= Helpers =================
+// ===== Packages / Paywall state =====
+const subscriptionsPkg = {};     // businessId -> { packageId, status, currentPeriodEnd }
+const usageCountsPkg = {};       // businessId -> # of free basic calls
+const pendingApprovalsPkg = {};  // token -> { businessId|null, packageId, amount, provisionalRef, businessName, industry, contact, requestedAt }
+
+// ===== Packages (luxury copy, no "AI") =====
+const PACKAGES = {
+  basic: {
+    id: "basic",
+    name: "R150 – Basic (Self-Service Alice EntrepreBot Assistant)",
+    price: 150,
+    benefits: [
+      "Weekly industry insights & trending hooks",
+      "What to post, when to post, which platform",
+      "Payday awareness (15th, 25th–30th)",
+      "Simple revenue forecasts",
+      "Core ops: Bookings, Leads, FAQs, Staff login, Agenda, Clock-in/out"
+    ]
+  },
+  pro: {
+    id: "pro",
+    name: "R250 – Pro (Alice Assistant + Virtual Consultations)",
+    price: 250,
+    benefits: [
+      "Everything in Basic",
+      "2× Virtual Consultations per month (strategy sessions with Alice)",
+      "Automatic reminders to staff/clients",
+      "Priority booking system for CEO/staff scheduling"
+    ]
+  },
+  elite: {
+    id: "elite",
+    name: "R500 – Elite (Tailor-Made Business Consulting by Alice)",
+    price: 500,
+    benefits: [
+      "Everything in Pro",
+      "Tailor-made consulting: strategy plans, competitor benchmarks, ROI planning",
+      "More virtual consultations (up to 4–6 per month)",
+      "Premium analytics & KPI dashboards",
+      "Referral & reward automation (client suggestions, referrals, loyalty discounts)"
+    ]
+  }
+};
+
+// ===== Helpers =====
 const nowIso = () => new Date().toISOString();
 
 const requireBusinessId = (req, res, next) => {
@@ -48,10 +92,53 @@ const requireStaffAuth = (req, res, next) => {
   }
 };
 
-// ================= Health =================
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "Alice Starter API", time: nowIso() });
+function hasActiveSubPkg(bid, packageId) {
+  const s = subscriptionsPkg[bid];
+  const now = Math.floor(Date.now()/1000);
+  return !!(s && s.status === "active" && s.packageId === packageId && (!s.currentPeriodEnd || s.currentPeriodEnd > now));
+}
+
+// Gate: Basic gets first 40 calls free; Pro/Elite always paid
+function gateByPackage(packageId = "basic") {
+  return (req, res, next) => {
+    const bid = req.headers["x-business-id"];
+    if (!bid) return res.status(401).json({ error: "Missing or invalid X-Business-Id" });
+
+    if (hasActiveSubPkg(bid, packageId)) return next();
+
+    if (packageId === "basic") {
+      usageCountsPkg[bid] = (usageCountsPkg[bid] || 0) + 1;
+      if (usageCountsPkg[bid] <= 40) return next();
+    }
+
+    return res.status(402).json({
+      error: "Subscription required",
+      message: "Choose a package to continue: R150 / R250 / R500",
+      packages: Object.values(PACKAGES).map(p => ({
+        id: p.id, name: p.name, price: p.price, benefits: p.benefits
+      }))
+    });
+  };
+}
+
+// ===== Email transport (Gmail App Password) =====
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: Number(process.env.SMTP_PORT || 587),
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
 });
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
+const ADMIN_KEY   = process.env.ADMIN_KEY || "change-me";
+const BASE_URL    = process.env.PUBLIC_BASE_URL || "http://localhost:8080";
+
+async function sendEmail(to, subject, html) {
+  try { await mailer.sendMail({ from: process.env.SMTP_USER, to, subject, html }); }
+  catch (e) { console.error("Email error:", e.message); }
+}
+
+// ================= Health =================
+app.get("/", (_req, res) => res.json({ ok: true, service: "Alice Starter API", time: nowIso() }));
 app.get("/healthz", (_req, res) => res.json({ ok: true, time: nowIso() }));
 
 // ================= Business =================
@@ -75,7 +162,6 @@ app.post("/staff/create", requireBusinessId, (req, res) => {
   staff.push({ id, businessId: req.businessId, name, nationalId, pin, role: role || "staff" });
   res.json({ id });
 });
-
 app.post("/staff/login", requireBusinessId, (req, res) => {
   const { name, nationalId, pin } = req.body || {};
   const person = staff.find(
@@ -89,12 +175,10 @@ app.post("/staff/login", requireBusinessId, (req, res) => {
   );
   res.json({ token, staff: { id: person.id, name: person.name, role: person.role } });
 });
-
 app.get("/staff/agenda", requireStaffAuth, (req, res) => {
   const items = bookings.filter(b => b.businessId === req.user.businessId && b.staffId === req.user.staffId && b.status !== "cancelled");
   res.json({ bookings: items });
 });
-
 app.post("/staff/clock-in", requireStaffAuth, (req, res) => {
   attendance.push({ id: uuid(), businessId: req.user.businessId, staffId: req.user.staffId, type: "in", timestamp: nowIso() });
   res.json({ ok: true });
@@ -120,8 +204,7 @@ app.post("/bookings", requireBusinessId, (req, res) => {
   const { clientName, contact, service, when, staffId, notes } = req.body || {};
   if (!clientName || !contact || !service || !when) return res.status(400).json({ error: "clientName, contact, service, when required" });
   const entry = {
-    id: uuid(), businessId: req.businessId,
-    clientName, contact, service, when,
+    id: uuid(), businessId: req.businessId, clientName, contact, service, when,
     staffId: staffId || null, notes: notes || "", status: "confirmed"
   };
   bookings.push(entry);
@@ -147,7 +230,7 @@ app.post("/faqs", requireBusinessId, (req, res) => {
 });
 
 // ================= Insights (mock logic) =================
-app.post("/insights/weekly", requireBusinessId, (req, res) => {
+app.post("/insights/weekly", requireBusinessId, gateByPackage("basic"), (req, res) => {
   const biz = businesses[req.businessId] || {};
   const industry = biz.industry || "general";
   res.json({
@@ -167,7 +250,7 @@ app.post("/insights/weekly", requireBusinessId, (req, res) => {
   });
 });
 
-app.post("/insights/forecast", requireBusinessId, (req, res) => {
+app.post("/insights/forecast", requireBusinessId, gateByPackage("basic"), (req, res) => {
   const { baselineWeeklyRevenue = 10000, marketingSpend = 1500 } = req.body || {};
   const paydayBoost = 0.12, trendBoost = 0.05;
   const projected = Math.round(baselineWeeklyRevenue * (1 + paydayBoost + trendBoost));
@@ -181,98 +264,19 @@ app.post("/insights/forecast", requireBusinessId, (req, res) => {
   });
 });
 
-// ===================================================================
-//                PACKAGES + PAYWALL + EFT + EMAIL
-// ===================================================================
-
-// --- Email transport (Gmail App Password) ---
-const mailerPkg = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: false,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+// ================= Example gated routes for Pro / Elite =================
+app.post("/consultations", requireBusinessId, gateByPackage("pro"), (req, res) => {
+  // Demo only
+  res.json({ ok: true, note: "Consultation booked (demo). Replace with your own logic." });
 });
-const ADMIN_EMAIL_PKG = process.env.ADMIN_EMAIL;
-const ADMIN_KEY_PKG   = process.env.ADMIN_KEY || "change-me";
-const BASE_URL_PKG    = process.env.PUBLIC_BASE_URL || "http://localhost:8080";
+app.post("/upgrade/premium", requireBusinessId, gateByPackage("elite"), (req, res) => {
+  // Demo only
+  res.json({ ok: true, note: "Premium upgrade active (demo). Replace with your own logic." });
+});
 
-// --- State ---
-const usageCountsPkg = {};       // businessId -> # of free basic calls
-const subscriptionsPkg = {};     // businessId -> { packageId, status, currentPeriodEnd }
-const pendingApprovalsPkg = {};  // token -> { businessId, packageId, amount, requestedAt }
-
-// --- Packages (wording without saying "AI") ---
-const PACKAGES = {
-  basic: {
-    id: "basic",
-    name: "R150 – Basic (Self-Service Alice EntrepreBot Assistant)",
-    price: 150,
-    benefits: [
-      "Weekly industry insights & trending hooks",
-      "What to post, when to post, which platform",
-      "Payday awareness (15th, 25th–30th)",
-      "Simple revenue forecasts",
-      "Core: Bookings, Leads, FAQs, Staff login, Agenda, Clock-in/out"
-    ]
-  },
-  pro: {
-    id: "pro",
-    name: "R250 – Pro (Alice Assistant + Virtual Consultations)",
-    price: 250,
-    benefits: [
-      "Everything in Basic",
-      "2x Virtual Consultations per month (strategy sessions with Alice)",
-      "Automatic reminders to staff/clients",
-      "Priority booking system for CEO/staff scheduling"
-    ]
-  },
-  elite: {
-    id: "elite",
-    name: "R500 – Elite (Tailor-Made Business Consulting by Alice)",
-    price: 500,
-    benefits: [
-      "Everything in Pro",
-      "Tailor-made business consulting: strategy plans, competitor benchmarks, ROI planning",
-      "More virtual consultations (up to 4–6 per month)",
-      "Premium analytics & KPI dashboards",
-      "Referral & reward automation (client suggestions, referrals, loyalty discounts)"
-    ]
-  }
-};
-
-async function sendPkgEmail(to, subject, html) {
-  try { await mailerPkg.sendMail({ from: process.env.SMTP_USER, to, subject, html }); }
-  catch (e) { console.error("Email error:", e.message); }
-}
-
-function hasActiveSubPkg(bid, packageId) {
-  const s = subscriptionsPkg[bid];
-  const now = Math.floor(Date.now()/1000);
-  return !!(s && s.status === "active" && s.packageId === packageId && (!s.currentPeriodEnd || s.currentPeriodEnd > now));
-}
-
-// Gate: basic free first 40 calls; pro/elite always paid
-function gateByPackage(packageId = "basic") {
-  return (req, res, next) => {
-    const bid = req.headers["x-business-id"];
-    if (!bid) return res.status(401).json({ error: "Missing businessId" });
-
-    if (hasActiveSubPkg(bid, packageId)) return next();
-
-    if (packageId === "basic") {
-      usageCountsPkg[bid] = (usageCountsPkg[bid] || 0) + 1;
-      if (usageCountsPkg[bid] <= 40) return next();
-    }
-
-    return res.status(402).json({
-      error: "Subscription required",
-      message: "Choose a package to continue: R150 / R250 / R500",
-      packages: Object.values(PACKAGES).map(p => ({
-        id: p.id, name: p.name, price: p.price, benefits: p.benefits
-      }))
-    });
-  };
-}
+// ===================================================================
+//                BILLING: Packages, EFT (no header), Email approval
+// ===================================================================
 
 // List packages
 app.get("/billing/packages", (_req, res) => {
@@ -281,11 +285,13 @@ app.get("/billing/packages", (_req, res) => {
   })));
 });
 
-// Start EFT: returns message with total and bank details
-app.post("/billing/eft/start", requireBusinessId, (req, res) => {
-  const { packageId } = req.body || {};
+// Start EFT — FAST PATH (no Business-Id required)
+app.post("/billing/eft/start", (req, res) => {
+  const { packageId = "basic", businessName = "New Business", industry = "general", contact = "" } = req.body || {};
   const pack = PACKAGES[packageId] || PACKAGES.basic;
-  const bid = req.businessId;
+
+  const headerBid = req.headers["x-business-id"];
+  const provisionalRef = headerBid || ("P-" + uuid().slice(0,6).toUpperCase());
 
   const message = `💳 EFT Payment Instructions
 Service: ${pack.name}
@@ -295,69 +301,108 @@ Bank: FNB
 Account Name: Alice N
 Account Type: Cheque
 Account Number: 63092455097
-Reference: ${bid}
+Reference: ${provisionalRef}
 
 After payment, reply: DONE`;
 
-  res.json({ ok: true, packageId: pack.id, amount: pack.price, message });
+  res.json({
+    ok: true,
+    packageId: pack.id,
+    amount: pack.price,
+    message,
+    provisionalRef,
+    note: headerBid ? "Using your Business ID as reference." : "Fast start: no Business ID yet; using provisional reference."
+  });
 });
 
-// Client says DONE: email admin with approve link
-app.post("/billing/eft/done", requireBusinessId, (req, res) => {
-  const { packageId = "basic" } = req.body || {};
-  const pack = PACKAGES[packageId] || PACKAGES.basic;
-  const bid = req.businessId;
+// Confirm EFT (DONE) — FAST PATH (no Business-Id required)
+app.post("/billing/eft/done", (req, res) => {
+  const {
+    packageId = "basic",
+    provisionalRef = "",
+    businessName = "New Business",
+    industry = "general",
+    contact = ""
+  } = req.body || {};
 
+  const pack = PACKAGES[packageId] || PACKAGES.basic;
+  const headerBid = req.headers["x-business-id"];
   const token = uuid().slice(0, 6).toUpperCase();
+
   pendingApprovalsPkg[token] = {
-    businessId: bid, packageId: pack.id, amount: pack.price, requestedAt: Date.now()
+    businessId: headerBid || null,
+    packageId: pack.id,
+    amount: pack.price,
+    requestedAt: Date.now(),
+    provisionalRef: provisionalRef || ("P-" + uuid().slice(0,6).toUpperCase()),
+    businessName,
+    industry,
+    contact
   };
 
-  const approveLink = `${BASE_URL_PKG}/admin/approve?token=${token}&days=30&key=${encodeURIComponent(ADMIN_KEY_PKG)}`;
-  const denyLink    = `${BASE_URL_PKG}/admin/deny?token=${token}&key=${encodeURIComponent(ADMIN_KEY_PKG)}`;
+  const approveLink = `${BASE_URL}/admin/approve?token=${token}&days=30&key=${encodeURIComponent(ADMIN_KEY)}`;
+  const denyLink    = `${BASE_URL}/admin/deny?token=${token}&key=${encodeURIComponent(ADMIN_KEY)}`;
 
   const html = `
     <h3>EFT Claim</h3>
-    <p><b>Business:</b> ${bid}</p>
-    <p><b>Package:</b> ${pack.name}</p>
-    <p><b>Amount:</b> R${pack.price}</p>
-    <p><b>Token:</b> ${token}</p>
+    <p><b>Provisional Ref:</b> ${pendingApprovalsPkg[token].provisionalRef}</p>
+    <p><b>Package:</b> ${pack.name} (R${pack.price})</p>
+    <p><b>BusinessId:</b> ${headerBid || "(none yet)"} </p>
+    <p><b>Business Name:</b> ${businessName}</p>
+    <p><b>Industry:</b> ${industry}</p>
+    <p><b>Contact:</b> ${contact}</p>
     <p><a href="${approveLink}">✅ Approve 30 days</a> | <a href="${denyLink}">❌ Deny</a></p>
   `;
-  sendPkgEmail(process.env.ADMIN_EMAIL, `[Alice Bot EFT] ${pack.name} - Business ${bid}`, html);
+  sendEmail(ADMIN_EMAIL, `[Alice EFT] ${pack.name} — Ref ${pendingApprovalsPkg[token].provisionalRef}`, html);
 
-  res.json({ ok: true, message: "Claim sent to admin. You’ll be unlocked after verification." });
+  res.json({ ok: true, message: "Claim sent to admin. You’ll be unlocked after verification.", token });
 });
 
-// Approve / Deny (email links)
+// Approve — auto-creates a Business if missing
 app.get("/admin/approve", (req, res) => {
   const { token, days = "30", key } = req.query || {};
-  if (key !== ADMIN_KEY_PKG) return res.status(401).send("Unauthorized");
+  if (key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
   const pending = pendingApprovalsPkg[token];
   if (!pending) return res.status(400).send("Invalid token");
+
+  // Ensure we have a businessId; if missing, create one from pending info
+  let bid = pending.businessId;
+  if (!bid) {
+    bid = uuid();
+    businesses[bid] = {
+      name: pending.businessName || "Approved Business",
+      industry: pending.industry || "general",
+      timezone: "Africa/Johannesburg"
+    };
+  }
+
   const expiresAt = Date.now() + Number(days) * 24 * 3600 * 1000;
-  subscriptionsPkg[pending.businessId] = {
+  subscriptionsPkg[bid] = {
     status: "active",
     packageId: pending.packageId,
     currentPeriodEnd: Math.floor(expiresAt / 1000)
   };
+
+  const approvedHtml = `
+    <h3>Approved</h3>
+    <p><b>BusinessId:</b> ${bid}</p>
+    <p><b>Package:</b> ${pending.packageId}</p>
+    <p><b>Expires:</b> ${new Date(expiresAt).toISOString()}</p>
+    <p><b>Ref:</b> ${pending.provisionalRef}</p>
+    <p><b>Name/Industry:</b> ${pending.businessName} / ${pending.industry}</p>
+  `;
   delete pendingApprovalsPkg[token];
-  res.send(`<h3>Approved ${days} days for ${pending.businessId} (${pending.packageId})</h3>`);
+  res.setHeader("Content-Type", "text/html");
+  res.send(approvedHtml);
 });
+
+// Deny
 app.get("/admin/deny", (req, res) => {
   const { token, key } = req.query || {};
-  if (key !== ADMIN_KEY_PKG) return res.status(401).send("Unauthorized");
+  if (key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
   delete pendingApprovalsPkg[token];
   res.send("<h3>Denied</h3>");
 });
-
-// Apply gates to premium features
-app.post("/insights/weekly",   requireBusinessId, gateByPackage("basic"),   (req,res,next)=>next()); // logic already above; gate runs first
-app.post("/insights/forecast", requireBusinessId, gateByPackage("basic"),   (req,res,next)=>next());
-app.post("/consultations",     requireBusinessId, gateByPackage("pro"),     (req,res)=>res.json({ ok:true, note:"Consultation booked (demo)" }));
-app.post("/upgrade/premium",   requireBusinessId, gateByPackage("elite"),   (req,res)=>res.json({ ok:true, note:"Premium upgrade active (demo)" }));
-
-// NOTE: The actual insights logic executes in earlier handlers; gates run first.
 
 // ================= Start =================
 const PORT = process.env.PORT || 8080;
