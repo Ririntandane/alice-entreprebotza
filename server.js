@@ -1,4 +1,6 @@
-// ===== Alice EntrepreBot Server (CommonJS, zero Business-ID required) =====
+// ===== Alice EntrepreBot Server (CommonJS) =====
+// Zero Business-ID required: businesses are auto-created/matched by name + industry + contact.
+
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
@@ -14,20 +16,22 @@ app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 
-// ---------------- In-memory data ----------------
+// ---------------- In-memory state ----------------
 const businesses = {};   // id -> { name, industry, timezone }
-const bizIndex = {};     // key -> businessId  (key = normalized "name|industry" or contact)
-const bookings = [];
-const leads = [];
-const staff = [];
-const attendance = [];
-const overtime = [];
-const faqs = {};
+const bizIndex = {};     // normalized key -> businessId (key: "name|industry" and/or "c:<contact>")
+const bookings = [];     // { id, businessId, clientName, contact, service, when, staffId, notes, status }
+const leads = [];        // { id, businessId, name, contact, service, budget, source, notes }
+const staff = [];        // { id, businessId, name, nationalId, pin, role }
+const attendance = [];   // { id, businessId, staffId, type, timestamp }
+const overtime = [];     // { id, businessId, staffId, hours, reason, status }
+const faqs = {};         // businessId -> [{ q, a }]
+
+// Subscriptions & approvals
 const subscriptions = {};     // businessId -> { packageId, status, currentPeriodEnd }
 const usageCounts = {};       // businessId -> number (free basic calls)
 const pendingApprovals = {};  // token -> { businessId|null, packageId, amount, provisionalRef, businessName, industry, contact, requestedAt }
 
-// ===== Packages =====
+// ---------------- Packages (includes R500/R1000/R4000/R7000) ----------------
 const PACKAGES = {
   basic: {
     id: "basic",
@@ -54,34 +58,79 @@ const PACKAGES = {
   },
   elite: {
     id: "elite",
-    name: "R500 – Elite (Tailor-Made Business Consulting by Alice)",
+    name: "R500 – Elite (Exclusive consulting access, 30-day window)",
     price: 500,
     benefits: [
       "Everything in Pro",
-      "Tailored strategy & ROI planning",
-      "More consultations (4–6/month)",
-      "Premium analytics & KPI dashboards",
-      "Referral & reward automation"
+      "Elite concierge access",
+      "30–31 day strategy window per cycle",
+      "Creation cap: up to 6 assets (images/mockups/PDF/docs) per 30 days",
+      "Tailored insights, competitor checks, ROI planning"
+    ]
+  },
+  elite_plus: {
+    id: "elite_plus",
+    name: "R1000 – Elite+ Monthly (expanded creation cap)",
+    price: 1000,
+    benefits: [
+      "Everything in Elite",
+      "30–31 day strategy & campaign planning per cycle",
+      "Creation cap: up to 15 assets per 30 days",
+      "Priority turnarounds & extended reviews"
+    ]
+  },
+  elite_6mo: {
+    id: "elite_6mo",
+    name: "R4000 – Elite (6 Months, upfront)",
+    price: 4000,
+    benefits: [
+      "6-month engagement, upfront payment",
+      "Half-year roadmaps & projects (plan for the year, deliver 6 months)",
+      "All creation needs unlocked (fair-use), priority support",
+      "Mid-cycle reviews & adjustments"
+    ]
+  },
+  elite_12mo: {
+    id: "elite_12mo",
+    name: "R7000 – Elite (12 Months, upfront)",
+    price: 7000,
+    benefits: [
+      "12-month engagement, upfront payment",
+      "Annual plan, quarterly reviews, all creation unlocked (fair-use)",
+      "Full campaign orchestration & premium analytics",
+      "Highest priority, annual retrospective & replan"
     ]
   }
 };
 
-// ===== Email transport =====
+// ---------------- Email transport (Gmail App Password) ----------------
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: Number(process.env.SMTP_PORT || 587),
   secure: false,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
 });
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
 const ADMIN_KEY   = process.env.ADMIN_KEY || "change-me";
 const BASE_URL    = process.env.PUBLIC_BASE_URL || "http://localhost:8080";
 
-// ===== Helpers =====
+async function sendEmail(to, subject, html) {
+  try {
+    const info = await mailer.sendMail({ from: process.env.SMTP_USER, to, subject, html });
+    console.log("Email sent:", info.messageId);
+  } catch (e) {
+    console.error("Email error:", e && e.response ? e.response : e);
+  }
+}
+
+// ---------------- Helpers ----------------
 const nowIso = () => new Date().toISOString();
 const norm = (s="") => String(s).trim().toLowerCase();
 
-// Create or find a business automatically (no headers)
+// Auto-create or match a business (by name + industry + contact)
 function ensureBusiness({ businessName, industry, contact }) {
   const name = businessName || "Auto Business";
   const ind  = industry || "general";
@@ -104,11 +153,11 @@ function ensureBusiness({ businessName, industry, contact }) {
 
 function hasActiveSub(bid, packageId) {
   const s = subscriptions[bid];
-  const now = Math.floor(Date.now()/1000);
+  const now = Math.floor(Date.now() / 1000);
   return !!(s && s.status === "active" && s.packageId === packageId && (!s.currentPeriodEnd || s.currentPeriodEnd > now));
 }
 
-// Gate: Basic gets 40 free calls; Pro/Elite paid
+// Gate: Basic gets 40 free calls; everything else requires active sub
 function gateByPackage(packageId = "basic") {
   return (req, res, next) => {
     const { businessName, industry, contact } = req.body || {};
@@ -118,7 +167,6 @@ function gateByPackage(packageId = "basic") {
       req.businessId = bid;
       return next();
     }
-
     if (packageId === "basic") {
       usageCounts[bid] = (usageCounts[bid] || 0) + 1;
       if (usageCounts[bid] <= 40) {
@@ -126,10 +174,9 @@ function gateByPackage(packageId = "basic") {
         return next();
       }
     }
-
     return res.status(402).json({
       error: "Subscription required",
-      message: "Choose a package to continue: R150 / R250 / R500",
+      message: "Choose a package to continue: R150 / R250 / R500 / R1000 / R4000 / R7000",
       packages: Object.values(PACKAGES).map(p => ({
         id: p.id, name: p.name, price: p.price, benefits: p.benefits
       }))
@@ -137,7 +184,7 @@ function gateByPackage(packageId = "basic") {
   };
 }
 
-// Staff JWT (kept for completeness; not needed by GPT)
+// Staff JWT (optional)
 function requireStaffAuth(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth) return res.status(401).json({ error: "Missing Authorization header" });
@@ -151,16 +198,30 @@ function requireStaffAuth(req, res, next) {
   }
 }
 
-async function sendEmail(to, subject, html) {
-  try { await mailer.sendMail({ from: process.env.SMTP_USER, to, subject, html }); }
-  catch (e) { console.error("Email error:", e.message); }
-}
-
-// ================= Health =================
+// ---------------- Health ----------------
 app.get("/", (_req, res) => res.json({ ok: true, service: "Alice API", time: nowIso() }));
 app.get("/healthz", (_req, res) => res.json({ ok: true, time: nowIso() }));
 
-// ================= Business (optional; still usable) =================
+// ---------------- Onboarding (WELCOME) ----------------
+// Use this first to collect details & create/match a business immediately.
+app.post("/onboard/welcome", (req, res) => {
+  const { businessName, industry, contact } = req.body || {};
+  if (!businessName || !industry) {
+    return res.status(400).json({ error: "businessName and industry required" });
+  }
+  const bid = ensureBusiness({ businessName, industry, contact });
+  const msg = `Welcome to Alice ✨ — I’ve registered **${businessName}** (${industry})${contact ? " with contact " + contact : ""}. We’re ready to proceed.`;
+  res.json({ ok: true, businessId: bid, business: businesses[bid], message: msg });
+});
+
+// Resolve or create business and return ID (useful for greeting/personal touch)
+app.post("/business/resolve", (req, res) => {
+  const { businessName, industry, contact } = req.body || {};
+  const bid = ensureBusiness({ businessName, industry, contact });
+  res.json({ businessId: bid, business: businesses[bid] });
+});
+
+// Optional explicit create
 app.post("/business/create", (req, res) => {
   const { name, industry, timezone } = req.body || {};
   if (!name || !industry) return res.status(400).json({ error: "name and industry required" });
@@ -169,7 +230,7 @@ app.post("/business/create", (req, res) => {
   res.json({ businessId: id, business: businesses[id] });
 });
 
-// ================= Staff (optional JWT features) =================
+// ---------------- Staff (optional JWT features) ----------------
 app.post("/staff/create", (req, res) => {
   const { businessName, industry, contact, name, nationalId, pin, role } = req.body || {};
   if (!name || !nationalId || !pin) return res.status(400).json({ error: "name, nationalId, pin required" });
@@ -178,18 +239,14 @@ app.post("/staff/create", (req, res) => {
   staff.push({ id, businessId: bid, name, nationalId, pin, role: role || "staff" });
   res.json({ id, businessId: bid });
 });
-
 app.post("/staff/login", (req, res) => {
   const { businessName, industry, contact, name, nationalId, pin } = req.body || {};
   const bid = ensureBusiness({ businessName, industry, contact });
-  const person = staff.find(
-    s => s.businessId === bid && s.name === name && s.nationalId === nationalId && s.pin === pin
-  );
+  const person = staff.find(s => s.businessId === bid && s.name === name && s.nationalId === nationalId && s.pin === pin);
   if (!person) return res.status(401).json({ error: "Invalid credentials" });
   const token = jwt.sign({ staffId: person.id, businessId: bid, role: person.role }, JWT_SECRET, { expiresIn: "8h" });
   res.json({ token, staff: { id: person.id, name: person.name, role: person.role }, businessId: bid });
 });
-
 app.get("/staff/agenda", requireStaffAuth, (req, res) => {
   const items = bookings.filter(b => b.businessId === req.user.businessId && b.staffId === req.user.staffId && b.status !== "cancelled");
   res.json({ bookings: items });
@@ -210,7 +267,7 @@ app.post("/staff/overtime", requireStaffAuth, (req, res) => {
   res.json(entry);
 });
 
-// ================= Bookings (no Business-ID; auto) =================
+// ---------------- Bookings (auto business) ----------------
 app.get("/bookings", (req, res) => {
   const { businessName, industry, contact } = req.query || {};
   const bid = ensureBusiness({ businessName, industry, contact });
@@ -238,7 +295,7 @@ app.post("/bookings", (req, res) => {
   res.json({ businessId: bid, booking: entry });
 });
 
-// ================= Leads =================
+// ---------------- Leads ----------------
 app.post("/leads", (req, res) => {
   const { businessName, industry, contact, name, service, budget, source, notes } = req.body || {};
   const clientContact = req.body.clientContact || contact;
@@ -249,7 +306,7 @@ app.post("/leads", (req, res) => {
   res.json({ businessId: bid, lead: entry });
 });
 
-// ================= FAQs =================
+// ---------------- FAQs ----------------
 app.get("/faqs", (req, res) => {
   const { businessName, industry, contact } = req.query || {};
   const bid = ensureBusiness({ businessName, industry, contact });
@@ -263,7 +320,7 @@ app.post("/faqs", (req, res) => {
   res.json({ businessId: bid, ok: true });
 });
 
-// ================= Insights (mock logic; auto business) =================
+// ---------------- Insights (auto business; Basic gated to 40 free) ----------------
 app.post("/insights/weekly", gateByPackage("basic"), (req, res) => {
   const bid = req.businessId || ensureBusiness(req.body || {});
   const biz = businesses[bid] || {};
@@ -285,7 +342,6 @@ app.post("/insights/weekly", gateByPackage("basic"), (req, res) => {
     bestTimes: { Instagram: ["18:00"], TikTok: ["11:00"], Facebook: ["12:30"] }
   });
 });
-
 app.post("/insights/forecast", gateByPackage("basic"), (req, res) => {
   const bid = req.businessId || ensureBusiness(req.body || {});
   const { baselineWeeklyRevenue = 10000, marketingSpend = 1500 } = req.body || {};
@@ -302,29 +358,21 @@ app.post("/insights/forecast", gateByPackage("basic"), (req, res) => {
   });
 });
 
-// ================= Pro / Elite demo gates =================
-app.post("/consultations", gateByPackage("pro"), (req, res) => {
-  const bid = req.businessId || ensureBusiness(req.body || {});
-  res.json({ businessId: bid, ok: true, note: "Consultation booked (demo)" });
-});
-app.post("/upgrade/premium", gateByPackage("elite"), (req, res) => {
-  const bid = req.businessId || ensureBusiness(req.body || {});
-  res.json({ businessId: bid, ok: true, note: "Premium upgrade active (demo)" });
-});
-
-// ================= Billing: Packages & EFT (no business needed) =================
+// ---------------- Billing ----------------
 app.get("/billing/packages", (_req, res) => {
   res.json(Object.values(PACKAGES).map(p => ({
     id: p.id, name: p.name, price: p.price, benefits: p.benefits
   })));
 });
 
-// Start EFT — no business required
+// Start EFT — uses provided businessName/industry/contact for a sticky identity
 app.post("/billing/eft/start", (req, res) => {
   const { packageId = "basic", businessName = "New Business", industry = "general", contact = "" } = req.body || {};
   const pack = PACKAGES[packageId] || PACKAGES.basic;
-  const provisionalRef = "P-" + uuid().slice(0, 6).toUpperCase();
+  // stickiness: ensure business now (so it exists through the flow)
+  const bid = ensureBusiness({ businessName, industry, contact });
 
+  const provisionalRef = "P-" + uuid().slice(0, 6).toUpperCase();
   const message = `💳 EFT Payment Instructions
 Service: ${pack.name}
 Total: R${pack.price}
@@ -337,22 +385,38 @@ Reference: ${provisionalRef}
 
 After payment, reply: DONE`;
 
-  res.json({ ok: true, packageId: pack.id, amount: pack.price, message, provisionalRef, businessName, industry, contact });
+  res.json({
+    ok: true,
+    businessId: bid,
+    packageId: pack.id,
+    amount: pack.price,
+    message,
+    provisionalRef,
+    businessName, industry, contact
+  });
 });
 
-// DONE — email admin; business created on approval if missing
-app.post("/billing/eft/done", (req, res) => {
+// DONE — email admin; client gets confirmation after admin approval
+app.post("/billing/eft/done", async (req, res) => {
   const { packageId = "basic", provisionalRef = "", businessName = "New Business", industry = "general", contact = "" } = req.body || {};
   const pack = PACKAGES[packageId] || PACKAGES.basic;
   const token = uuid().slice(0, 6).toUpperCase();
 
   pendingApprovals[token] = {
-    businessId: null, packageId: pack.id, amount: pack.price, requestedAt: Date.now(),
+    businessId: null,
+    packageId: pack.id,
+    amount: pack.price,
+    requestedAt: Date.now(),
     provisionalRef: provisionalRef || ("P-" + uuid().slice(0,6).toUpperCase()),
     businessName, industry, contact
   };
 
-  const approveLink = `${BASE_URL}/admin/approve?token=${token}&days=30&key=${encodeURIComponent(ADMIN_KEY)}`;
+  const days =
+    packageId === "elite_6mo" ? 180 :
+    packageId === "elite_12mo" ? 365 :
+    30;
+
+  const approveLink = `${BASE_URL}/admin/approve?token=${token}&days=${days}&key=${encodeURIComponent(ADMIN_KEY)}`;
   const denyLink    = `${BASE_URL}/admin/deny?token=${token}&key=${encodeURIComponent(ADMIN_KEY)}`;
 
   const html = `
@@ -362,21 +426,26 @@ app.post("/billing/eft/done", (req, res) => {
     <p><b>Business Name:</b> ${businessName}</p>
     <p><b>Industry:</b> ${industry}</p>
     <p><b>Contact:</b> ${contact}</p>
-    <p><a href="${approveLink}">✅ Approve 30 days</a> | <a href="${denyLink}">❌ Deny</a></p>
+    <p><a href="${approveLink}">✅ Approve</a> | <a href="${denyLink}">❌ Deny</a></p>
   `;
-  sendEmail(ADMIN_EMAIL, `[Alice EFT] ${pack.name} — Ref ${pendingApprovals[token].provisionalRef}`, html);
+  await sendEmail(ADMIN_EMAIL, `[Alice EFT] ${pack.name} — Ref ${pendingApprovals[token].provisionalRef}`, html);
 
   res.json({ ok: true, message: "Claim sent to admin. You’ll be unlocked after verification.", token });
 });
 
-app.get("/admin/approve", (req, res) => {
+// Approve — activates sub, sends client confirmation (with Business ID)
+app.get("/admin/approve", async (req, res) => {
   const { token, days = "30", key } = req.query || {};
-  if (key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
+  if (key !== process.env.ADMIN_KEY) return res.status(401).send("Unauthorized");
   const pending = pendingApprovals[token];
   if (!pending) return res.status(400).send("Invalid token");
 
-  // Create business on approval
-  const bid = ensureBusiness({ businessName: pending.businessName, industry: pending.industry, contact: pending.contact });
+  // Create/match business for a sticky identity
+  const bid = ensureBusiness({
+    businessName: pending.businessName,
+    industry: pending.industry,
+    contact: pending.contact
+  });
 
   const expiresAt = Date.now() + Number(days) * 24 * 3600 * 1000;
   subscriptions[bid] = {
@@ -385,7 +454,7 @@ app.get("/admin/approve", (req, res) => {
     currentPeriodEnd: Math.floor(expiresAt / 1000)
   };
 
-  const approvedHtml = `
+  const adminHtml = `
     <h3>Approved</h3>
     <p><b>BusinessId:</b> ${bid}</p>
     <p><b>Package:</b> ${pending.packageId}</p>
@@ -393,18 +462,48 @@ app.get("/admin/approve", (req, res) => {
     <p><b>Ref:</b> ${pending.provisionalRef}</p>
     <p><b>Name/Industry:</b> ${pending.businessName} / ${pending.industry}</p>
   `;
+  const clientHtml = `
+    <h3>Your Alice EntrepreBot subscription is active ✅</h3>
+    <p><b>Business:</b> ${pending.businessName} (${pending.industry || "general"})</p>
+    <p><b>Business ID:</b> ${bid}</p>
+    <p><b>Package:</b> ${PACKAGES[pending.packageId]?.name || pending.packageId}</p>
+    <p><b>Active until:</b> ${new Date(expiresAt).toLocaleString()}</p>
+    <p>You can now ask Alice for insights, bookings, and more using your business details.</p>
+  `;
+
+  // Notify admin and (if email provided) the client
+  await sendEmail(ADMIN_EMAIL, `Approved: ${pending.businessName} (${pending.packageId})`, adminHtml);
+  if (pending.contact && /@/.test(pending.contact)) {
+    await sendEmail(pending.contact, "Welcome to Alice EntrepreBot — Access Activated", clientHtml);
+  }
+
   delete pendingApprovals[token];
   res.setHeader("Content-Type", "text/html");
-  res.send(approvedHtml);
+  res.send(adminHtml);
 });
 
+// Deny
 app.get("/admin/deny", (req, res) => {
   const { token, key } = req.query || {};
-  if (key !== ADMIN_KEY) return res.status(401).send("Unauthorized");
+  if (key !== process.env.ADMIN_KEY) return res.status(401).send("Unauthorized");
   delete pendingApprovals[token];
   res.send("<h3>Denied</h3>");
 });
 
-// ================= Start =================
+// ---------------- Subscription status (handy for GPT to check) ----------------
+app.post("/billing/status", (req, res) => {
+  const { businessName, industry, contact } = req.body || {};
+  const bid = ensureBusiness({ businessName, industry, contact });
+  const s = subscriptions[bid] || null;
+  const active = !!(s && s.status === "active" && (!s.currentPeriodEnd || s.currentPeriodEnd > Math.floor(Date.now()/1000)));
+  res.json({
+    businessId: bid,
+    active,
+    packageId: s?.packageId || null,
+    currentPeriodEnd: s?.currentPeriodEnd || null
+  });
+});
+
+// ---------------- Start ----------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Alice API listening on :${PORT}`));
